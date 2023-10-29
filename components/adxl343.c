@@ -38,6 +38,8 @@
 */
 #define CMD_MULTI_BYTE_MASK  (0x1U)
 
+#define ADXL_NUM_CALIB_SAMPLES  (16U)
+
 /* *****************************************************************************
  *  Types
  * ****************************************************************************/
@@ -58,22 +60,29 @@ static const char TAG[] = "adxl343";
 /* *****************************************************************************
  *  Local Functions
  * ****************************************************************************/
-static esp_err_t _RegRead(adxl343_context_t *ctx, uint8_t RegAddr, uint8_t *pRegVal)
+/** \brief Read multiple registers in a single SPI frame.
+ * 
+ * \param[in] ctx The ADXL343 context
+ * \param[in] regAddrStart The first register to read
+ * \param[in] numRegs The number of registers to read
+ * \param[out] pBuffer Pointer to buffer where the read content will be stored
+ */
+static esp_err_t _RegReadMultiple(adxl343_context_t *ctx, uint8_t regAddrStart, uint8_t numRegs, uint8_t *pBuffer)
 {
     spi_transaction_t t = 
         {
-            .cmd = CMD_READ,
-            .addr = RegAddr,
-            .rxlength = 8U,
-            .flags = SPI_TRANS_USE_RXDATA,
+            .cmd = (CMD_READ | CMD_MULTI_BYTE_MASK),
+            .addr = regAddrStart,
+            .rxlength = (numRegs*8U),
+            .rx_buffer = (uint8_t*)pBuffer,
             .user = ctx,
         };
-    esp_err_t err = spi_device_polling_transmit(ctx->spi, &t);
-    if (ESP_OK == err)
-    {
-        *pRegVal = t.rx_data[0U];
-    }
-    return err;
+    return spi_device_polling_transmit(ctx->spi, &t);
+}
+
+static esp_err_t _RegRead(adxl343_context_t *ctx, uint8_t RegAddr, uint8_t *pRegVal)
+{
+    return _RegReadMultiple(ctx, RegAddr, 1U, pRegVal);
 }
 
 static esp_err_t _RegWrite(adxl343_context_t *ctx, uint8_t RegAddr, uint8_t RegVal)
@@ -180,6 +189,58 @@ esp_err_t Adxl343_DeInit(adxl343_context_t *ctx)
     return ESP_OK;
 }
 
+static void _CalibrationTask(void *pParameter)
+{
+    adxl343_handle_t *pAdxl343Hdl = (adxl343_handle_t*)pParameter;
+    esp_err_t err;
+    const TickType_t xFrequency = (((ADXL_NUM_CALIB_SAMPLES*100U)/1000U)+1U) / portTICK_PERIOD_MS;
+    TickType_t xLastWakeTime;
+
+    /* initialize calibration */
+    err = _RegWrite(*pAdxl343Hdl, 
+                    ADXL343_FIFO_CTRL_REG_ADDR, 
+                    (ADXL343_FIFO_MODE_FIFO | ADXL_NUM_CALIB_SAMPLES)
+                   );
+    if (ESP_OK == err)
+    {
+        // Initialise the xLastWakeTime variable with the current time.
+        xLastWakeTime = xTaskGetTickCount();
+        while (1)
+        {
+            uint8_t int_src;
+
+            // Wait for the next cycle.
+            vTaskDelayUntil(&xLastWakeTime, xFrequency);
+            err = _RegRead(*pAdxl343Hdl, ADXL343_INT_SRC_REG_ADDR, &int_src);
+            if (ESP_OK == err)
+            {
+                if (int_src & ADXL343_INT_SRC_WATERMARK)
+                {
+                    /* there are ADXL_NUM_CALIB_SAMPLES in the FIFO -> read them */
+                    uint8_t sample[6U]; /* x, y and z each have 2 bytes */
+                    spi_device_acquire_bus((*pAdxl343Hdl)->spi, portMAX_DELAY);
+                    for (unsigned int s=0U; s<ADXL_NUM_CALIB_SAMPLES; s++)
+                    {
+                        if (ESP_OK == _RegReadMultiple(*pAdxl343Hdl, ADXL343_DATAX0_REG_ADDR, 6U, sample))
+                        {
+                            uint16_t datax = ((uint16_t)sample[1U]<<8U) | sample[0U];
+                            uint16_t datay = ((uint16_t)sample[3U]<<8U) | sample[2U];
+                            uint16_t dataz = ((uint16_t)sample[5U]<<8U) | sample[4U];
+                            ESP_LOGI(TAG, "DATAX=%04x DATAY=%04x DATAZ=%04x", datax, datay, dataz);
+                        }
+                    }
+                    spi_device_release_bus((*pAdxl343Hdl)->spi);
+                }
+            }
+        }   
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Error during calibration initialization");
+    }
+
+}
+
 /** \brief This task gets the ambient temperatur (in C) from TI TMP126 via SPI */
 void Adxl343_Task(void *pParameter)
 {
@@ -190,17 +251,21 @@ void Adxl343_Task(void *pParameter)
     TickType_t xLastWakeTime;
 
     // Initialise the xLastWakeTime variable with the current time.
-     xLastWakeTime = xTaskGetTickCount();
+    xLastWakeTime = xTaskGetTickCount();
+    if (pdTRUE != xTaskCreatePinnedToCore(_CalibrationTask, "calib343", 2048, pAdxl343Hdl, tskIDLE_PRIORITY+1U, NULL, 1U))
+    {
+        ESP_LOGE(TAG, "creating ADXL343 calibration task failed");
+    }
 
     while (1)
     {
         ESP_LOGI(TAG, "Device ID");
-        err = _RegRead(*pAdxl343Hdl, ADXL343_DEVICE_ID_REG_ADDR, &regVal); /*pTmp126Hdl, false, &temp_sign, &tempC, &tempFrac);*/
+        err = _RegRead(*pAdxl343Hdl, ADXL343_DEVICE_ID_REG_ADDR, &regVal);
         if (ESP_OK == err)
         {
             ESP_LOGI(TAG, "--> %02x", regVal);
         }
         // Wait for the next cycle.
-         vTaskDelayUntil( &xLastWakeTime, xFrequency );
+        vTaskDelayUntil( &xLastWakeTime, xFrequency );
     }
 }
